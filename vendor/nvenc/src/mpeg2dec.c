@@ -179,7 +179,7 @@ static int decode_pending(Mpeg2Dec *d)
               DRF_DEF(C9B0, _SEMAPHORE_D, _OPERATION, _RELEASE) | DRF_DEF(C9B0, _SEMAPHORE_D, _PAYLOAD_SIZE, _32BIT));
     const double t0 = now_ms();
     chan_submit(c);
-    while (sv[0] != val && now_ms() - t0 < 1000) { }
+    chan_wait_sem(sv, val, t0, 1000);
     d->engine_ms = now_ms() - t0;
     if (sv[0] != val) { fprintf(stderr, "mpeg2dec: no completion (error notifier 0x%x)\n", chan_error(c)); return -1; }
     const nvdec_status_s *st = d->status.cpu;

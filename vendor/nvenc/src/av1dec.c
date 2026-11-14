@@ -228,7 +228,7 @@ static void film_grain_setup(const Av1FilmGrain *g, int bd, av1_fgs_cfg_t *cfg, 
     }
     const int gmin = -(128 << (bd - 8)), gmax = (128 << (bd - 8)) - 1;
     const int shift = 12 - bd + g->grain_scale_shift, ar_shift = g->ar_coeff_shift_minus_6 + 6, lag = g->ar_coeff_lag;
-    static int luma[LUMA_W * LUMA_H], cb[CHROMA_W * CHROMA_H], cr[CHROMA_W * CHROMA_H];
+    int luma[LUMA_W * LUMA_H], cb[CHROMA_W * CHROMA_H], cr[CHROMA_W * CHROMA_H];
     memset(luma, 0, sizeof luma);
     if (g->num_y_points > 0) {
         uint16_t r = (uint16_t)g->grain_seed;
@@ -547,7 +547,7 @@ static int decode_frame(Av1Dec *d)
               DRF_DEF(C9B0, _SEMAPHORE_D, _OPERATION, _RELEASE) | DRF_DEF(C9B0, _SEMAPHORE_D, _PAYLOAD_SIZE, _32BIT));
     const double t0 = now_ms();
     chan_submit(c);
-    while (sv[0] != val && now_ms() - t0 < 1000) { }
+    chan_wait_sem(sv, val, t0, 1000);
     d->engine_ms = now_ms() - t0;
     if (sv[0] != val) { fprintf(stderr, "av1dec: no completion (error notifier 0x%x)\n", chan_error(c)); return -1; }
     const nvdec_status_s *st = d->status.cpu;
@@ -624,7 +624,7 @@ int av1dec_tu(Av1Dec *d, const uint8_t *buf, size_t n)
             }
         } else if (o.type == AV1_OBU_TILE_GROUP && d->have_hdr) { tg = pl; tgn = o.payload_len; }
         if (tg) {
-            static Av1Tile tl[AV1_MAX_TILES]; int start; bool last;
+            Av1Tile tl[AV1_MAX_TILES]; int start; bool last;
             const int nt = av1_parse_tile_group(&d->f, tg, tgn, tl, AV1_MAX_TILES, &start, &last);
             if (nt < 0) { fprintf(stderr, "av1dec: tile group error\n"); return -1; }
             for (int t = 0; t < nt; t++) {   // each tile's data, back to back in the bitstream buffer
