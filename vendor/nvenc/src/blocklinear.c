@@ -50,26 +50,41 @@ static void untile_band_slow(uint8_t *dst, size_t dst_stride, const uint8_t *src
             memcpy(dst + y * dst_stride + x, src + nvenc_in_offset(x, y, pitch), n);
         }
 }
+static inline void untile_tile(uint8_t *d, size_t dst_stride, const __m128i *s, int nt)
+{
+    for (int y8 = 0; y8 < 2; y8++)
+        for (int x32 = 0; x32 < 2; x32++)
+            for (int y4 = 0; y4 < 2; y4++)
+                for (int x16 = 0; x16 < 2; x16++) {
+                    uint8_t *r = d + (size_t)(y8 * 8 + y4 * 4) * dst_stride + x32 * 32 + x16 * 16;
+                    __m128i v0 = _mm_load_si128(s++), v1 = _mm_load_si128(s++);
+                    __m128i v2 = _mm_load_si128(s++), v3 = _mm_load_si128(s++);
+                    if (nt) {
+                        _mm_stream_si128((__m128i *)r, v0);
+                        _mm_stream_si128((__m128i *)(r + dst_stride), v1);
+                        _mm_stream_si128((__m128i *)(r + 2 * dst_stride), v2);
+                        _mm_stream_si128((__m128i *)(r + 3 * dst_stride), v3);
+                    } else {
+                        _mm_storeu_si128((__m128i *)r, v0);
+                        _mm_storeu_si128((__m128i *)(r + dst_stride), v1);
+                        _mm_storeu_si128((__m128i *)(r + 2 * dst_stride), v2);
+                        _mm_storeu_si128((__m128i *)(r + 3 * dst_stride), v3);
+                    }
+                }
+}
 static void untile_band(uint8_t *dst, size_t dst_stride, const uint8_t *src, size_t width, size_t band, size_t rows, size_t pitch)
 {
     size_t y0 = band * 16, y1 = y0 + 16 < rows ? y0 + 16 : rows;
     if (y1 - y0 < 16) { untile_band_slow(dst, dst_stride, src, 0, width, y0, y1, pitch); return; }
     size_t full = width / 64;
     uint8_t *d0 = dst + y0 * dst_stride;
-    for (size_t t = 0; t < full; t++) {
-        const __m128i *s = (const __m128i *)(src + band * pitch * 16 + t * 1024);   // one tile, read in order
-        uint8_t *d = d0 + t * 64;
-        for (int y8 = 0; y8 < 2; y8++)
-            for (int x32 = 0; x32 < 2; x32++)
-                for (int y4 = 0; y4 < 2; y4++)
-                    for (int x16 = 0; x16 < 2; x16++) {
-                        uint8_t *r = d + (size_t)(y8 * 8 + y4 * 4) * dst_stride + x32 * 32 + x16 * 16;
-                        _mm_storeu_si128((__m128i *)r, _mm_load_si128(s++));
-                        _mm_storeu_si128((__m128i *)(r + dst_stride), _mm_load_si128(s++));
-                        _mm_storeu_si128((__m128i *)(r + 2 * dst_stride), _mm_load_si128(s++));
-                        _mm_storeu_si128((__m128i *)(r + 3 * dst_stride), _mm_load_si128(s++));
-                    }
-    }
+    int nt = (((uintptr_t)d0 | dst_stride) & 15) == 0;
+    if (nt)
+        for (size_t t = 0; t < full; t++)
+            untile_tile(d0 + t * 64, dst_stride, (const __m128i *)(src + band * pitch * 16 + t * 1024), 1);   // one tile, read in order, stream writes to bypass cache
+    else
+        for (size_t t = 0; t < full; t++)
+            untile_tile(d0 + t * 64, dst_stride, (const __m128i *)(src + band * pitch * 16 + t * 1024), 0);
     if (full * 64 < width) untile_band_slow(dst, dst_stride, src, full * 64, width, y0, y1, pitch);
 }
 void nvenc_in_untile_plane(uint8_t *dst, size_t dst_stride, const uint8_t *src, size_t width, size_t rows, size_t pitch)
@@ -79,10 +94,14 @@ void nvenc_in_untile_plane(uint8_t *dst, size_t dst_stride, const uint8_t *src, 
     if (bands >= 32) {
         // memory-bound: 4K NV12 into a VideoToolbox pool buffer took 6.7 ms with 1 thread, 4.7 with 2, 3.4 with 4, 3.8 with 6-8 (T11.05)
         const size_t chunks = 4, per = (bands + chunks - 1) / chunks;
-        dispatch_apply(chunks, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t k) {
-            for (size_t b = k * per; b < (k + 1) * per && b < bands; b++) untile_band(dst, dst_stride, src, width, b, rows, pitch); });
-    } else
+        dispatch_apply(chunks, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t k) {
+            for (size_t b = k * per; b < (k + 1) * per && b < bands; b++) untile_band(dst, dst_stride, src, width, b, rows, pitch);
+            _mm_sfence();
+        });
+    } else {
         for (size_t b = 0; b < bands; b++) untile_band(dst, dst_stride, src, width, b, rows, pitch);
+        _mm_sfence();
+    }
 }
 
 // ---- the layouts by generation (blocklinear.h) ----

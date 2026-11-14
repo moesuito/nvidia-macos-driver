@@ -3,6 +3,9 @@
 // channel (engineType), bind, object, schedule, work-submit token.
 #pragma once
 #include "rm.h"
+#include "nv_floor.h"
+#include <time.h>
+#include <unistd.h>
 
 typedef struct {
     Rm *rm;
@@ -33,3 +36,22 @@ size_t chan_push_used(Chan *c);                // bytes of push buffer in use
 NvU32 chan_error(Chan *c);                     // RM's error notifier status (0 = none)
 // the channel's last MMU fault (NV906F_CTRL_CMD_GET_MMU_FAULT_INFO; RM clears it on read)
 NV_STATUS chan_fault(Chan *c, NvU64 *addr, NvU32 *type, char str[32]);
+
+// Spin briefly for microsecond-scale semaphore completions, then yield instead of burning a full core.
+static inline double chan_now_ms(void)
+{
+    struct timespec t;
+    NV_CLOCK_GETTIME(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+}
+static inline void chan_wait_sem(volatile const NvU32 *sv, NvU32 val, double t0, double timeout_ms)
+{
+    for (int spin = 0; spin < 64; spin++) {
+        if (sv[0] == val) return;
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#endif
+    }
+    while (sv[0] != val && chan_now_ms() - t0 < timeout_ms)
+        usleep(50);
+}

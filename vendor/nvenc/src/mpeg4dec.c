@@ -244,7 +244,7 @@ static int decode_vop(Mpeg4Dec *d, const uint8_t *vop, size_t len, const VopInfo
               DRF_DEF(C9B0, _SEMAPHORE_D, _OPERATION, _RELEASE) | DRF_DEF(C9B0, _SEMAPHORE_D, _PAYLOAD_SIZE, _32BIT));
     const double t0 = now_ms();
     chan_submit(c);
-    while (sv[0] != val && now_ms() - t0 < 1000) { }
+    chan_wait_sem(sv, val, t0, 1000);
     d->engine_ms = now_ms() - t0;
     if (sv[0] != val) {
         NvU64 fa; NvU32 ft; char fs[32];

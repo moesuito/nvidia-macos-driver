@@ -1169,8 +1169,8 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
     if (!s1) { ids[nreg] = ENCODER_ID_AV1; names[nreg] = nameAv1; codecs[nreg++] = "AV1"; }
     rename_encoders(ids, names, codecs, nreg);
     extern OSStatus NVDecVT_Register(int rating);   // vt/nvencvt_dec.c: the H.264 decoder (NVDEC), same rating
-    NVDecVT_Register(rating);
-    return st;
+    OSStatus sd = NVDecVT_Register(rating);
+    return encoders ? st : sd;
 }
 
 // Added for NullMoth's driver. The decode service (VTDecoderXPCService) decodes for sandboxed Apple clients such as

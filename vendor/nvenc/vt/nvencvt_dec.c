@@ -81,6 +81,7 @@ typedef struct {
     Mpeg2Dec *m2;                   // MPEG-1/2 (with rm)
     Mpeg4Dec *m4;                   // MPEG-4 Part 2 (with rm)
     int nalLen, w, h;
+    bool full;
     OSType pf;                      // output pixel format (VP9: depends on the bit depth)
     CVPixelBufferPoolRef ownPool;   // our own pool, made with the client's destination attributes (see set_output)
     CFDictionaryRef colour;         // colour attachments for the output (from the format description)
@@ -89,7 +90,7 @@ typedef struct {
     uint8_t *tmp; size_t tmpCap;    // a non-contiguous sample, flattened
     // asynchronous output (T8.09): pictures waiting for the output thread (copy, emit, release), in decode order
     struct OutJob { VTVideoDecoderFrame frame; OSStatus res; VTDecodeInfoFlags fl; CVPixelBufferRef pb; int surf, rel; unsigned w, h, cx, cy, usCopy, usEmit; } q[4];
-    unsigned qh, qt; bool async, thrOn, stop; pthread_t thr; pthread_cond_t cv;
+    unsigned qh, qt, qref[32]; uint32_t qrel; bool async, thrOn, stop; pthread_t thr; pthread_mutex_t qlock; pthread_cond_t cv;
 } DState;
 typedef struct OutJob OutJob;
 
@@ -180,7 +181,9 @@ static OSStatus b_invalidate(CMBaseObjectRef o)
     pthread_mutex_lock(&s->lock);
     if (s->thrOn && !pthread_equal(pthread_self(), s->thr)) {   // the waiting pictures out, then the output thread ends
         out_drain(s);
+        pthread_mutex_lock(&s->qlock);
         s->stop = true; pthread_cond_broadcast(&s->cv);
+        pthread_mutex_unlock(&s->qlock);
         pthread_mutex_unlock(&s->lock); pthread_join(s->thr, NULL); pthread_mutex_lock(&s->lock);
         s->thrOn = false;
     }
@@ -205,7 +208,7 @@ static OSStatus b_invalidate(CMBaseObjectRef o)
 static void b_finalize(CMBaseObjectRef o)
 {
     DState *s = dstate(o); if (!s) return;
-    b_invalidate(o); pthread_cond_destroy(&s->cv); pthread_mutex_destroy(&s->lock); free(s->tmp); free(s);
+    b_invalidate(o); pthread_cond_destroy(&s->cv); pthread_mutex_destroy(&s->qlock); pthread_mutex_destroy(&s->lock); free(s->tmp); free(s);
     *(DState **)CMBaseObjectGetDerivedStorage(o) = NULL;
 }
 static CFStringRef b_desc(CMBaseObjectRef o)
@@ -265,6 +268,7 @@ static OSStatus start_vp9(DState *s, VTVideoDecoderSession session, CMVideoForma
     if (vpcc && CFGetTypeID(vpcc) == CFDataGetTypeID() && CFDataGetLength(vpcc) >= 8) {
         const uint8_t *b = CFDataGetBytePtr(vpcc);
         depth = b[6] >> 4; chroma = (b[6] >> 1) & 7; full = b[6] & 1;
+        if (!depth) depth = (b[4] == 2 || b[4] == 3) ? 10 : 8;
     }
     // 4:2:0 (chromaSubsampling 0 or 1), 8 or 10 bits (12-bit decodes, but CoreVideo has no 12-bit 4:2:0 biplanar format)
     // TU117 (GTX 1650): no frames of 64 or less (vp9dec.c), so another decoder takes those; GA10x is not tried with
@@ -275,7 +279,7 @@ static OSStatus start_vp9(DState *s, VTVideoDecoderSession session, CMVideoForma
     DLOG("startSession: VP9 %dx%d, %d-bit, chroma %d, %s range%s", dim.width, dim.height, depth, chroma, full ? "full" : "video",
          vpcc ? "" : " (no vpcC: assumed)");
     if (!ok) return kVTVideoDecoderUnsupportedDataFormatErr;
-    s->w = dim.width; s->h = dim.height;
+    s->w = dim.width; s->h = dim.height; s->full = full;
     if (open_vp9(s, (unsigned)dim.width, (unsigned)dim.height, depth)) {
         DLOG("startSession: NVDEC session failed"); return kVTVideoDecoderMalfunctionErr;
     }
@@ -317,7 +321,7 @@ static OSStatus start_av1(DState *s, VTVideoDecoderSession session, CMVideoForma
     DLOG("startSession: AV1 %dx%d (largest %ux%u), %d-bit, %s range%s%s", dim.width, dim.height, W, H, depth, full ? "full" : "video",
          av1c ? "" : " (no av1C: assumed)", ok ? "" : " - NOT SUPPORTED");
     if (!ok) return kVTVideoDecoderUnsupportedDataFormatErr;
-    s->w = dim.width; s->h = dim.height;
+    s->w = dim.width; s->h = dim.height; s->full = full;
     if (open_av1(s, W, H, depth)) { DLOG("startSession: NVDEC session failed"); return kVTVideoDecoderMalfunctionErr; }
     s->opened = true;
     if (cfgN) av1dec_tu(s->av1, cfg, cfgN);   // the sequence header (samples may leave it out)
@@ -352,7 +356,7 @@ static OSStatus start_hevc(DState *s, VTVideoDecoderSession session, CMVideoForm
     const bool ok = cf >= 0 && (cf == 1 || cf == 3) && (depth == 8 || depth == 10) && cdepth == depth && W <= 8192 && H <= 8192;
     DLOG("startSession: HEVC %dx%d (coded %ux%u), %d-bit, chroma %d, %s range%s", cw, ch, W, H, depth, cf, full ? "full" : "video", ok ? "" : " - NOT SUPPORTED");
     if (!ok) return kVTVideoDecoderUnsupportedDataFormatErr;
-    s->w = cw; s->h = ch;
+    s->w = cw; s->h = ch; s->full = full;
     if (!(s->hevc = calloc(1, sizeof *s->hevc)) || rm_open(&s->rm) || rm_va_init(&s->rm) || hevcdec_open(s->hevc, &s->rm, W, H, depth, cf)) {
         DLOG("startSession: NVDEC session failed"); free(s->hevc); s->hevc = NULL; return kVTVideoDecoderMalfunctionErr;
     }
@@ -441,6 +445,7 @@ static OSStatus d_startSession(VTVideoDecoderRef o, VTVideoDecoderSession sessio
     const bool ok = sp->chroma_format_idc == 1 && sp->bit_depth_luma_minus8 == 0 && sp->bit_depth_chroma_minus8 == 0 && W <= 4096 && H <= 4096;
     s->w = sp->width; s->h = sp->height;
     const bool full = sp->video_full_range_flag;
+    s->full = full;
     DLOG("startSession: %dx%d (coded %ux%u) profile %d chroma %d depth %d %s", s->w, s->h, W, H, sp->profile_idc, sp->chroma_format_idc,
          sp->bit_depth_luma_minus8 + 8, ok ? "" : "- NOT SUPPORTED");
     free(pp);
@@ -458,11 +463,48 @@ static OSStatus d_startSession(VTVideoDecoderRef o, VTVideoDecoderSession sessio
     return st;
 }
 
+static bool same_biplanar_layout(OSType a, OSType b)
+{
+    if (a == b) return true;
+    if ((a == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange && b == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) ||
+        (a == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange && b == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)) return true;
+    if ((a == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange && b == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange) ||
+        (a == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange && b == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)) return true;
+    if ((a == kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange && b == kCVPixelFormatType_444YpCbCr8BiPlanarFullRange) ||
+        (a == kCVPixelFormatType_444YpCbCr8BiPlanarFullRange && b == kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange)) return true;
+    if ((a == kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange && b == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange) ||
+        (a == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange && b == kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange)) return true;
+    return false;
+}
+
+static OSType match_client_pf(CFTypeRef dpf, OSType pf)
+{
+    if (!dpf) return 0;
+    OSType v = 0;
+    if (CFGetTypeID(dpf) == CFNumberGetTypeID()) {
+        if (CFNumberGetValue((CFNumberRef)dpf, kCFNumberSInt32Type, &v) && same_biplanar_layout(v, pf)) return v;
+        return v;
+    }
+    if (CFGetTypeID(dpf) == CFArrayGetTypeID()) {
+        CFArrayRef arr = (CFArrayRef)dpf;
+        OSType fallback = 0;
+        for (CFIndex i = 0, n = CFArrayGetCount(arr); i < n; i++) {
+            CFTypeRef el = CFArrayGetValueAtIndex(arr, i);
+            OSType cur = 0;
+            if (el && CFGetTypeID(el) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)el, kCFNumberSInt32Type, &cur)) {
+                if (cur == pf) return cur;
+                if (!fallback && same_biplanar_layout(cur, pf)) fallback = cur;
+            }
+        }
+        return fallback;
+    }
+    return 0;
+}
+
 // The pixel buffer attributes for the session (our format, the range the stream says) and the colour attachments
 static OSStatus set_output(DState *s, VTVideoDecoderSession session, CMVideoFormatDescriptionRef fmt, OSType pf, bool full)
 {
     OSStatus st;
-    s->pf = pf;
     if (gDLog) {   // what the client asked for (T8.06: matching it avoids a conversion inside EmitDecodedFrame)
         CFDictionaryRef dst = VTDecoderSessionGetDestinationPixelBufferAttributes(session);
         CFStringRef ds = dst ? CFCopyDescription(dst) : NULL; char buf[2048] = "(none)";
@@ -470,6 +512,12 @@ static OSStatus set_output(DState *s, VTVideoDecoderSession session, CMVideoForm
         for (char *c = buf; *c; c++) if (*c == '\n') *c = ' ';
         DLOG("destination attributes: %s", buf);
     }
+    CFDictionaryRef dst = VTDecoderSessionGetDestinationPixelBufferAttributes(session);
+    if (dst) CFRetain(dst);   // also for our own pool below (released at its end)
+    CFTypeRef dpf = dst ? CFDictionaryGetValue(dst, kCVPixelBufferPixelFormatTypeKey) : NULL;
+    OSType want = match_client_pf(dpf, pf);
+    if (!getenv("NVDEC_STRICT_RANGE") && want && same_biplanar_layout(want, pf)) pf = want;
+    s->pf = pf;
     CFNumberRef npf = CFNumberCreate(NULL, kCFNumberSInt32Type, &pf), nw = CFNumberCreate(NULL, kCFNumberIntType, &s->w), nh = CFNumberCreate(NULL, kCFNumberIntType, &s->h);
     CFDictionaryRef ios = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     const void *k[] = { kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey, kCVPixelBufferHeightKey, kCVPixelBufferIOSurfacePropertiesKey };
@@ -478,11 +526,9 @@ static OSStatus set_output(DState *s, VTVideoDecoderSession session, CMVideoForm
     // When the client asks for the format we produce, hand out buffers made exactly to its attributes: otherwise
     // VideoToolbox copies every frame into a compatible one inside EmitDecodedFrame (ffmpeg asks for OpenGL-compatible
     // IOSurfaces: 18.7 ms per 4K frame).
-    CFDictionaryRef dst = VTDecoderSessionGetDestinationPixelBufferAttributes(session);
-    if (dst) CFRetain(dst);   // also for our own pool below (released at its end)
-    CFNumberRef dpf = dst ? CFDictionaryGetValue(dst, kCVPixelBufferPixelFormatTypeKey) : NULL; OSType want = 0;
-    if (!getenv("NVDEC_OWNATTRS") && dpf && CFGetTypeID(dpf) == CFNumberGetTypeID() && CFNumberGetValue(dpf, kCFNumberSInt32Type, &want) && want == pf) {
+    if (!getenv("NVDEC_OWNATTRS") && dst && (!dpf || want == pf)) {
         CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(NULL, 0, dst);
+        CFDictionarySetValue(m, kCVPixelBufferPixelFormatTypeKey, npf);
         CFDictionarySetValue(m, kCVPixelBufferWidthKey, nw); CFDictionarySetValue(m, kCVPixelBufferHeightKey, nh);
         if (!CFDictionaryContainsKey(m, kCVPixelBufferIOSurfacePropertiesKey)) CFDictionarySetValue(m, kCVPixelBufferIOSurfacePropertiesKey, ios);
         CFRelease(attrs); attrs = m;
@@ -493,14 +539,14 @@ static OSStatus set_output(DState *s, VTVideoDecoderSession session, CMVideoForm
         CFRelease(attrs); attrs = m;
     }
     st = VTDecoderSessionSetPixelBufferAttributes(session, attrs);
-    CFRelease(attrs); CFRelease(ios); CFRelease(npf); CFRelease(nw); CFRelease(nh);
+    CFRelease(attrs); CFRelease(ios); CFRelease(nw); CFRelease(nh);
     // Our own pool, made with the client's destination attributes verbatim (PR #1). A client that asks for an
     // OpenGL-compatible buffer (ffmpeg, mpv: kCVPixelBufferIOSurfaceOpenGLTextureCompatibilityKey) cannot have one on
     // this system: CVPixelBufferIsCompatibleWithAttributes answers 0 for every buffer, even one made with those very
     // attributes. VideoToolbox then transfers every decoded picture into a buffer of its own (14-32 ms per 4K frame
     // through the GPU driver's Metal path, RTX 3060 Ti and RTX 4090), instead of handing the decoder's buffer over. The picture is copied into the
     // buffer we hand out, so if that buffer carries the destination's own attributes VideoToolbox has nothing to transfer.
-    // Only when such a buffer holds our picture as it is: the client's pixel format is ours (one format, not a list) and
+    // Only when such a buffer holds our picture as it is: the client's pixel format is ours (or a list containing it) and
     // its size, if it names one, is the picture's; anything else (BGRA, 8-bit for a 10-bit stream, a scaled size) keeps
     // the session's pool and VideoToolbox's conversion. NVDEC_NOOWNPOOL=1 leaves it out. (T8.07 measured the transfer.)
     if (s->ownPool) { CVPixelBufferPoolRelease(s->ownPool); s->ownPool = NULL; }
@@ -508,11 +554,17 @@ static OSStatus set_output(DState *s, VTVideoDecoderSession session, CMVideoForm
         int dw = s->w, dh = s->h; CFNumberRef x;
         if ((x = CFDictionaryGetValue(dst, kCVPixelBufferWidthKey)) && CFGetTypeID(x) == CFNumberGetTypeID()) CFNumberGetValue(x, kCFNumberIntType, &dw);
         if ((x = CFDictionaryGetValue(dst, kCVPixelBufferHeightKey)) && CFGetTypeID(x) == CFNumberGetTypeID()) CFNumberGetValue(x, kCFNumberIntType, &dh);
-        const bool fits = want == pf && dw == s->w && dh == s->h;
+        const bool fits = (!dpf || want == pf) && dw == s->w && dh == s->h;
         if (fits) {
-            CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(NULL, 0, dst);   // the size made explicit (a pool needs one)
+            CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(NULL, 0, dst);   // the size and single pixel format made explicit (a pool needs both)
             CFNumberRef w2 = CFNumberCreate(NULL, kCFNumberIntType, &s->w), h2 = CFNumberCreate(NULL, kCFNumberIntType, &s->h);
+            CFDictionarySetValue(m, kCVPixelBufferPixelFormatTypeKey, npf);
             CFDictionarySetValue(m, kCVPixelBufferWidthKey, w2); CFDictionarySetValue(m, kCVPixelBufferHeightKey, h2);
+            if (!CFDictionaryContainsKey(m, kCVPixelBufferIOSurfacePropertiesKey)) {
+                CFDictionaryRef ios2 = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+                CFDictionarySetValue(m, kCVPixelBufferIOSurfacePropertiesKey, ios2);
+                CFRelease(ios2);
+            }
             CFRelease(w2); CFRelease(h2);
             CVPixelBufferPoolRef pool = NULL;
             if (CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, m, &pool) == kCVReturnSuccess && pool) s->ownPool = pool;
@@ -522,6 +574,7 @@ static OSStatus set_output(DState *s, VTVideoDecoderSession session, CMVideoForm
         DLOG("  our own pool: %s", s->ownPool ? "yes (the client's destination attributes)" : fits ? "no (CVPixelBufferPoolCreate failed)"
                                     : "no (the client's format or size is not the picture's: the session's pool, VideoToolbox converts)");
     }
+    CFRelease(npf);
     if (dst) CFRelease(dst);
     CFMutableDictionaryRef col = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     // colour description and HDR metadata from the format description (the extension keys are the attachment keys), as
@@ -545,7 +598,9 @@ static OSStatus output_buffer(DState *s, unsigned w, unsigned h, CVPixelBufferRe
         // old size for clients like ffmpeg that keep their session across the change: AV1 after a new sequence header)
         DLOG("frame size %dx%d -> %ux%u: new pixel buffer attributes", s->w, s->h, w, h);
         s->w = (int)w; s->h = (int)h;
-        set_output(s, s->session, s->fmt, s->pf, s->pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange || s->pf == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange);
+        set_output(s, s->session, s->fmt, s->pf,
+                   s->pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange || s->pf == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange ||
+                   s->pf == kCVPixelFormatType_444YpCbCr8BiPlanarFullRange || s->pf == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange);
     }
     CVPixelBufferPoolRef pool = s->ownPool ? s->ownPool : VTDecoderSessionGetPixelBufferPool(s->session);
     if (pool && (int)w == s->w && (int)h == s->h) return CVPixelBufferPoolCreatePixelBuffer(NULL, pool, pb);
@@ -582,15 +637,34 @@ static void out_copy(DState *s, OutJob *j)
     j->usCopy = (unsigned)((nowms() - tc) * 1000);
 }
 
-static void out_release(DState *s, const OutJob *j)   // lock held
+static void out_release_idx(DState *s, int rel)   // lock held
 {
-    if (j->rel < 0) return;
-    if (s->codec == CODEC_VP9) vp9dec_release(s->vp9, j->rel);
-    else if (s->codec == CODEC_AV1) av1dec_release(s->av1, j->rel);
-    else if (s->codec == kCMVideoCodecType_HEVC) hevcdec_release(s->hevc, j->rel);
-    else if (is_mpeg12(s->codec)) mpeg2dec_release(s->m2, j->rel);
-    else if (s->codec == kCMVideoCodecType_MPEG4Video) mpeg4dec_release(s->m4, j->rel);
-    else h264dec_release(&s->dec, j->rel);
+    if (rel < 0) return;
+    if (s->codec == CODEC_VP9) vp9dec_release(s->vp9, rel);
+    else if (s->codec == CODEC_AV1) av1dec_release(s->av1, rel);
+    else if (s->codec == kCMVideoCodecType_HEVC) hevcdec_release(s->hevc, rel);
+    else if (is_mpeg12(s->codec)) mpeg2dec_release(s->m2, rel);
+    else if (s->codec == kCMVideoCodecType_MPEG4Video) mpeg4dec_release(s->m4, rel);
+    else h264dec_release(&s->dec, rel);
+}
+static void out_release(DState *s, const OutJob *j) { out_release_idx(s, j->rel); }   // lock held
+
+static void out_reap(DState *s)   // lock held: release surfaces finished by out_thread
+{
+    pthread_mutex_lock(&s->qlock);
+    uint32_t m = s->qrel, ready = 0;
+    while (m) {
+        int i = __builtin_ctz(m);
+        m &= m - 1;
+        if (s->qref[i] == 0) ready |= (1u << i);
+    }
+    s->qrel &= ~ready;
+    pthread_mutex_unlock(&s->qlock);
+    while (ready) {
+        int i = __builtin_ctz(ready);
+        ready &= ready - 1;
+        out_release_idx(s, i);
+    }
 }
 
 static void out_emit(DState *s, OutJob *j)
@@ -604,50 +678,63 @@ static void out_emit(DState *s, OutJob *j)
 static void *out_thread(void *arg)
 {
     DState *s = arg;
-    pthread_mutex_lock(&s->lock);
+    pthread_mutex_lock(&s->qlock);
     for (;;) {
-        while (s->qh == s->qt && !s->stop) pthread_cond_wait(&s->cv, &s->lock);
+        while (s->qh == s->qt && !s->stop) pthread_cond_wait(&s->cv, &s->qlock);
         if (s->qh == s->qt) break;
         OutJob j = s->q[s->qh % 4];
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->qlock);
         const bool copied = j.pb && j.surf >= 0 && !j.res;
         out_copy(s, &j); out_emit(s, &j);
-        pthread_mutex_lock(&s->lock);
-        out_release(s, &j);
+        pthread_mutex_lock(&s->qlock);
+        if (j.surf >= 0 && j.surf < 32) s->qref[j.surf]--;
+        if (j.rel >= 0 && j.rel < 32) s->qrel |= (1u << j.rel);
         if (copied) s->tCopy += j.usCopy / 1000.0;
         s->tEmit += j.usEmit / 1000.0;
         s->qh++;
         pthread_cond_broadcast(&s->cv);
     }
-    pthread_mutex_unlock(&s->lock);
+    pthread_mutex_unlock(&s->qlock);
     return NULL;
 }
 
-static void out_drain(DState *s) { while (s->qh != s->qt) pthread_cond_wait(&s->cv, &s->lock); }   // lock held
+static void out_drain(DState *s)   // lock held
+{
+    pthread_mutex_lock(&s->qlock);
+    while (s->qh != s->qt) pthread_cond_wait(&s->cv, &s->qlock);
+    pthread_mutex_unlock(&s->qlock);
+    out_reap(s);
+}
 
 // hand a frame's output over (lock held): queued in an asynchronous run, else done here
 static void out_deliver(DState *s, OutJob *j)
 {
-    if (s->async) {
+    if (s->async && j->surf < 32 && j->rel < 32) {
         if (!s->thrOn) { s->stop = false; s->thrOn = pthread_create(&s->thr, NULL, out_thread, s) == 0; }
         if (s->thrOn) {
-            while (s->qt - s->qh >= 2) pthread_cond_wait(&s->cv, &s->lock);   // at most two pictures waiting
+            pthread_mutex_lock(&s->qlock);
+            while (s->qt - s->qh >= 2) pthread_cond_wait(&s->cv, &s->qlock);   // at most two pictures waiting
+            if (j->surf >= 0) s->qref[j->surf]++;
             s->q[s->qt % 4] = *j; s->qt++;
             pthread_cond_broadcast(&s->cv);
+            pthread_mutex_unlock(&s->qlock);
+            out_reap(s);
             return;
         }
     }
     out_drain(s);
     const bool copied = j->pb && j->surf >= 0 && !j->res;
     out_copy(s, j); out_release(s, j); out_emit(s, j);
+    pthread_mutex_lock(&s->qlock);
     if (copied) s->tCopy += j->usCopy / 1000.0;
     s->tEmit += j->usEmit / 1000.0;
+    pthread_mutex_unlock(&s->qlock);
 }
 
 // asynchronous output needs a surface beyond what the stream holds as references: not for streams that use (nearly) all
 static bool out_async_ok(DState *s)
 {
-    if (s->codec == kCMVideoCodecType_HEVC) return s->hevc && s->hevc->max_dec_pic <= HEVC_SURFACES - 2;
+    if (s->codec == kCMVideoCodecType_HEVC) return s->hevc && s->hevc->max_dec_pic <= HEVC_SURFACES - 3;
     if (s->codec == CODEC_VP9 || s->codec == CODEC_AV1 || is_mpeg12(s->codec) || s->codec == kCMVideoCodecType_MPEG4Video) return true;
     int refs = 0;
     for (int i = 0; i < 32; i++) if (s->dec.params.sps[i].max_num_ref_frames > refs) refs = s->dec.params.sps[i].max_num_ref_frames;
@@ -689,6 +776,11 @@ static OSStatus decode_vp9(DState *s, VTVideoDecoderFrame frame, const uint8_t *
 static OSStatus decode_av1(DState *s, VTVideoDecoderFrame frame, const uint8_t *p, size_t len)
 {
     OSStatus res = noErr; int shown = -1;
+    for (size_t pos = 0; s->async && pos < len;) {
+        Av1Obu o; if (av1_obu(p + pos, len - pos, &o)) break;
+        if (o.type == AV1_OBU_SEQUENCE_HEADER) { out_drain(s); break; }
+        pos += o.header_len + o.payload_len;
+    }
     const int r = av1dec_tu(s->av1, p, len);
     if (r < 0) res = kVTVideoDecoderBadDataErr;
     else {
@@ -804,6 +896,7 @@ static OSStatus d_decodeFrame(VTVideoDecoderRef o, VTVideoDecoderFrame frame, CM
     if (info) *info = 0;
     const double tA = nowms();
     pthread_mutex_lock(&s->lock);
+    out_reap(s);
     // asynchronous output when the client allows it (NVDEC_SYNC=1: never)
     s->async = (flags & kVTDecodeFrame_EnableAsynchronousDecompression) && s->opened && !getenv("NVDEC_SYNC") && out_async_ok(s);
     if (s->async && info) *info |= kVTDecodeInfo_Asynchronous;
@@ -811,10 +904,42 @@ static OSStatus d_decodeFrame(VTVideoDecoderRef o, VTVideoDecoderFrame frame, CM
     OSStatus res = noErr; CVPixelBufferRef pb = NULL;
     CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
     size_t len = bb ? CMBlockBufferGetDataLength(bb) : 0, avail = 0; char *p = NULL;
-    if (!len || !s->opened) res = kVTVideoDecoderBadDataErr;
-    else if (CMBlockBufferGetDataPointer(bb, 0, &avail, NULL, &p) || avail < len) {
+    if (!s->opened) res = kVTVideoDecoderBadDataErr;
+    else if (!len) {
+        OutJob j = { .frame = frame, .res = noErr, .fl = kVTDecodeInfo_FrameDropped, .surf = -1, .rel = -1 };
+        out_deliver(s, &j);
+        s->tLast = nowms(); s->tIn += s->tLast - tA;
+        pthread_mutex_unlock(&s->lock);
+        return noErr;
+    } else if (CMBlockBufferGetDataPointer(bb, 0, &avail, NULL, &p) || avail < len) {
         if (s->tmpCap < len) { free(s->tmp); s->tmp = malloc(len); s->tmpCap = s->tmp ? len : 0; }
         if (!s->tmp || CMBlockBufferCopyDataBytes(bb, 0, len, s->tmp)) res = kVTVideoDecoderBadDataErr; else p = (char *)s->tmp;
+    }
+    if (!res) {
+        CMFormatDescriptionRef sbfmt = CMSampleBufferGetFormatDescription(sb);
+        if (sbfmt && s->fmt && sbfmt != s->fmt && !CFEqual(sbfmt, s->fmt)) {
+            CFRelease(s->fmt);
+            s->fmt = (CMVideoFormatDescriptionRef)CFRetain(sbfmt);
+            if (s->codec == kCMVideoCodecType_H264) {
+                size_t count = 0; int nalLen = s->nalLen;
+                if (!CMVideoFormatDescriptionGetH264ParameterSetAtIndex(s->fmt, 0, NULL, NULL, &count, &nalLen) && count) {
+                    s->nalLen = nalLen;
+                    for (size_t i = 0; i < count; i++) {
+                        const uint8_t *ps; size_t n;
+                        if (!CMVideoFormatDescriptionGetH264ParameterSetAtIndex(s->fmt, i, &ps, &n, NULL, NULL) && n) h264dec_nal(&s->dec, ps, n);
+                    }
+                }
+            } else if (s->codec == kCMVideoCodecType_HEVC) {
+                size_t count = 0; int nalLen = s->nalLen;
+                if (!NV13(CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(s->fmt, 0, NULL, NULL, &count, &nalLen), 1) && count) {
+                    s->nalLen = nalLen;
+                    for (size_t i = 0; i < count; i++) {
+                        const uint8_t *ps; size_t n;
+                        if (!NV13(CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(s->fmt, i, &ps, &n, NULL, NULL), 1) && n) hevcdec_nal(s->hevc, ps, n);
+                    }
+                }
+            }
+        }
     }
     if (s->codec == CODEC_VP9 || s->codec == CODEC_AV1 || s->codec == kCMVideoCodecType_HEVC || is_mpeg12(s->codec) || s->codec == kCMVideoCodecType_MPEG4Video) {
         res = res ? res : s->codec == CODEC_AV1 ? decode_av1(s, frame, (const uint8_t *)p, len) :
@@ -839,8 +964,10 @@ static OSStatus d_decodeFrame(VTVideoDecoderRef o, VTVideoDecoderFrame frame, CM
     }
     if (!res && r == 1) {
         s->tEngine += s->dec.engine_ms; double tp = nowms();
-        CVPixelBufferPoolRef pool = VTDecoderSessionGetPixelBufferPool(s->session); OSStatus cst = pool ? CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &pb) : -1;
+        const unsigned fw = (unsigned)(s->dec.cur_w > 0 ? s->dec.cur_w : s->w), fh = (unsigned)(s->dec.cur_h > 0 ? s->dec.cur_h : s->h);
+        OSStatus cst = output_buffer(s, fw, fh, &pb);
         if (!cst && pb && gDLog && s->frames == 0) {   // does the client consider our buffer compatible? (else VT transfers every frame)
+            CVPixelBufferPoolRef pool = s->ownPool ? s->ownPool : VTDecoderSessionGetPixelBufferPool(s->session);
             typedef Boolean (*CompatFn)(CVPixelBufferRef, CFDictionaryRef);
             CompatFn compat = (CompatFn)dlsym(RTLD_DEFAULT, "CVPixelBufferIsCompatibleWithAttributes");
             CFDictionaryRef dst = VTDecoderSessionGetDestinationPixelBufferAttributes(s->session);
@@ -905,7 +1032,69 @@ static OSStatus d_copySerializable(VTVideoDecoderRef o, CFAllocatorRef al, CFDic
     if (out) *out = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     return noErr;
 }
-static Boolean d_canAccept(VTVideoDecoderRef o, CMFormatDescriptionRef f) { (void)o; DLOG("canAcceptFormatDescription %p: no", f); return false; }
+static bool ext_eq(CMFormatDescriptionRef a, CMFormatDescriptionRef b, CFStringRef k)
+{
+    CFTypeRef xa = CMFormatDescriptionGetExtension(a, k), xb = CMFormatDescriptionGetExtension(b, k);
+    return xa == xb || (xa && xb && CFEqual(xa, xb));
+}
+
+static Boolean d_canAccept(VTVideoDecoderRef o, CMFormatDescriptionRef f)
+{
+    DState *s = dstate(o);
+    pthread_mutex_lock(&s->lock);
+    Boolean ok = false;
+    if (!s->opened || !s->fmt || !f) goto done;
+    if (f == s->fmt || CFEqual(f, s->fmt)) { ok = true; goto done; }
+    if (CMFormatDescriptionGetMediaSubType(f) != CMFormatDescriptionGetMediaSubType(s->fmt)) goto done;
+    if (!ext_eq(f, s->fmt, kCMFormatDescriptionExtension_ColorPrimaries) ||
+        !ext_eq(f, s->fmt, kCMFormatDescriptionExtension_TransferFunction) ||
+        !ext_eq(f, s->fmt, kCMFormatDescriptionExtension_YCbCrMatrix)) goto done;
+    if (s->codec == kCMVideoCodecType_H264) {
+        size_t count = 0; int nalLen = 4;
+        if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(f, 0, NULL, NULL, &count, &nalLen) || !count || nalLen != s->nalLen) goto done;
+        H264Params *pp = calloc(1, sizeof *pp);
+        if (!pp) goto done;
+        int sps = -1;
+        for (size_t i = 0; i < count; i++) {
+            const uint8_t *ps; size_t n;
+            if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(f, i, &ps, &n, NULL, NULL) || !n) continue;
+            if ((ps[0] & 31) == H264_NAL_SPS && !h264_parse_sps(pp, ps, n))
+                for (int k = 0; k < 32; k++) if (pp->sps[k].valid) { sps = k; break; }
+        }
+        if (sps >= 0) {
+            const H264Sps *sp = &pp->sps[sps];
+            const unsigned W = (unsigned)(sp->pic_width_in_mbs_minus1 + 1) * 16;
+            const unsigned H = (unsigned)(sp->pic_height_in_map_units_minus1 + 1) * 16 * (2u - (unsigned)sp->frame_mbs_only_flag);
+            ok = sp->chroma_format_idc == 1 && sp->bit_depth_luma_minus8 == 0 && sp->bit_depth_chroma_minus8 == 0 &&
+                 (bool)sp->video_full_range_flag == s->full && W <= s->dec.maxW && H <= s->dec.maxH;
+        }
+        free(pp);
+    } else if (s->codec == kCMVideoCodecType_HEVC) {
+        size_t count = 0; int nalLen = 4;
+        if (NV13(CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(f, 0, NULL, NULL, &count, &nalLen), 1) || !count || nalLen != s->nalLen) goto done;
+        HevcParams *pp = calloc(1, sizeof *pp);
+        if (!pp) goto done;
+        unsigned W = 0, H = 0; int depth = 0, cdepth = 0, cf = -1; bool full = false;
+        for (size_t i = 0; i < count; i++) {
+            const uint8_t *ps; size_t n;
+            if (NV13(CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(f, i, &ps, &n, NULL, NULL), 1) || n < 2 || ((ps[0] >> 1) & 63) != HEVC_NAL_SPS) continue;
+            const int id = hevc_parse_sps(pp, ps, n); if (id < 0) continue;
+            const HevcSps *sp = &pp->sps[id];
+            if ((unsigned)sp->width > W) W = (unsigned)sp->width;
+            if ((unsigned)sp->height > H) H = (unsigned)sp->height;
+            if (cf < 0) {
+                depth = sp->bit_depth_luma; cdepth = sp->bit_depth_chroma; cf = sp->chroma_format_idc; full = sp->video_full_range_flag;
+            }
+        }
+        free(pp);
+        ok = s->hevc && cf == s->hevc->chroma_format && depth == s->hevc->bit_depth && cdepth == depth &&
+             full == s->full && W > 0 && H > 0 && W <= s->hevc->maxW && H <= s->hevc->maxH;
+    }
+done:
+    DLOG("canAcceptFormatDescription %p: %s", f, ok ? "yes" : "no");
+    pthread_mutex_unlock(&s->lock);
+    return ok;
+}
 static OSStatus d_finishDelayed(VTVideoDecoderRef o)
 {
     DState *s = dstate(o); DLOG("finishDelayedFrames");
@@ -936,7 +1125,7 @@ __attribute__((visibility("default"))) OSStatus NVDecVT_CreateInstance(FourCharC
     OSStatus st = CMDerivedObjectCreate(al, &gDVT.base, VTVideoDecoderGetClassID(), &obj);
     if (st) return st;
     DState *s = calloc(1, sizeof *s);
-    pthread_mutex_init(&s->lock, NULL); pthread_cond_init(&s->cv, NULL);
+    pthread_mutex_init(&s->lock, NULL); pthread_mutex_init(&s->qlock, NULL); pthread_cond_init(&s->cv, NULL);
     s->codec = codec;
     *(DState **)CMBaseObjectGetDerivedStorage(obj) = s;
     *out = obj;
@@ -961,11 +1150,8 @@ static NvU32 nvdec_class(void)
 
 // Called by NVEncVT_Register once the GPU checked out (Ada, GA10x or TU117). Rated above NullMoth's own H.264 / HEVC decoders (1000). HEVC,
 // VP9 and AV1 too (NVENCVT_NO_HEVCDEC / _VP9DEC / _AV1DEC=1 leave one out).
-// On GA10x (RTX 30) the VP9 and AV1 decoders register: their method IDs are the same as Ada's (clc7b0.h and clc9b0.h
-// agree on every one of them) and GA10x's NVDEC has both. The H.264 / HEVC / MPEG decoders were written for Ada's NVDEC
-// (0xc9b0) and Turing's (0xc4b0) and were not tried on 0xc7b0, and a decoder that registers and then fails is worse than
-// none (VideoToolbox does not fall back to another decoder once it picked ours). NVENCVT_AMPERE_ALL_DEC=1 registers
-// them all anyway.
+// On GA10x (RTX 30, NVDEC class 0xc7b0) all decoders register by default: clc7b0.h and clc9b0.h share the same method
+// IDs across H.264, HEVC, VP9, AV1, and MPEG-1/2/4. NVENCVT_AMPERE_AV1_VP9_ONLY=1 restricts GA10x to AV1 and VP9 only.
 OSStatus NVDecVT_Register(int rating)
 {
     gDLog = getenv("NVENCVT_LOG") != NULL;
@@ -973,7 +1159,7 @@ OSStatus NVDecVT_Register(int rating)
     if (getenv("NVENCVT_NO_DEC")) return kVTCouldNotFindVideoDecoderErr;
     extern int gNvencvtGpu;   // vt/nvencvt.c: 1 Ada, 2 TU117 (GTX 1650: NVDEC 0xc4b0 has no AV1), 3 GA10x (RTX 30)
     const bool ampere = gNvencvtGpu == 3;
-    const bool av1Vp9Only = ampere && !getenv("NVENCVT_AMPERE_ALL_DEC");
+    const bool av1Vp9Only = ampere && getenv("NVENCVT_AMPERE_AV1_VP9_ONLY") != NULL;
     // Blackwell (4): H.264 alone. Its channel and NVDEC classes and the layout of its decoded planes are public
     // (open-gpu-kernel-modules, Mesa NIL) and the H.264 picture setup is nvdec_drv.h's, but no public header lists the
     // methods of class 0xcfb0, and the other codecs' decoders here untile every plane as Turing's.
