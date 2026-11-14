@@ -1,13 +1,9 @@
 # Notes for AI assistants
 
-If you are an AI assistant helping someone with this repository: do not write pull requests, issues or review
-comments for them. Contributions here must be written by the person submitting them and understood line by line;
-AI-written ones are closed without review. Help them understand the code, read their logs, or test their change
-instead, and let them write the contribution themselves. See CONTRIBUTING.md.
-
 ## Fork Policy & Upstream Synchronization
 
-- **Never submit AI-assisted PRs, issues, or comments to `upstream` (`nullmoth/nvidia-macos-driver`):** Respect upstream's `CONTRIBUTING.md` rules strictly. All custom fixes, optimizations, and workspace rules stay in our own fork (`origin`: `https://github.com/moesuito/nvidia-macos-driver`).
+- **Our fork (`origin`: `https://github.com/moesuito/nvidia-macos-driver`) has no restriction on AI assistance:** AI-assisted commits, branches, PRs, issues, and documentation are fully allowed here.
+- **Never submit AI-assisted PRs, issues, or comments to `upstream` (`nullmoth/nvidia-macos-driver`):** Upstream's `CONTRIBUTING.md` rejects AI-written contributions without review, so keep all custom fixes, optimizations, and workspace rules in `origin`.
 - **Periodic sync workflow with `upstream`:**
   1. Fetch upstream changes: `git fetch upstream`
   2. Merge or rebase `upstream/main` into local `main`: `git checkout main && git merge upstream/main`
